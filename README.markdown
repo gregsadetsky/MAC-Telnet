@@ -87,7 +87,12 @@ Download source tarball, extract, compile and install:
 
 ### Mac OS X
 
-Download source tarball and extract:
+You can install directly using Homebrew:
+
+    brew trust gregsadetsky/mactelnet
+    brew install gregsadetsky/mactelnet/mactelnet
+
+Alternatively, you can download source tarball and extract:
 
     wget http://github.com/haakonnessjoen/MAC-Telnet/tarball/master -O mactelnet.tar.gz
     tar zxvf mactelnet.tar.gz
