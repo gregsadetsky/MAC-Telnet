@@ -53,6 +53,17 @@ m4_ifdef([PKG_PROG_PKG_CONFIG], [
     AC_SEARCH_LIBS([EVP_MD_CTX_new], [crypto], [], [AC_MSG_FAILURE([can't find openssl >= 1.1.0 crypto lib])])
 ])
 
+# libvterm enables running a single command non-interactively (mactelnet <mac> <command>).
+# RouterOS interrogates the terminal on connect, so a terminal emulator is needed to
+# answer it. Optional: without it, mactelnet builds exactly as before.
+m4_ifdef([PKG_PROG_PKG_CONFIG], [
+  PKG_CHECK_MODULES([VTERM], [vterm], [
+    AC_DEFINE([HAVE_LIBVTERM], [1], [Define if libvterm is available])
+  ], [
+    AC_MSG_WARN([libvterm not found: running a command non-interactively will be unavailable])
+  ])
+])
+
 AC_ARG_WITH([config],
 	[AS_HELP_STRING([--without-config], [don't install default config file])],
 		[enable_config=$withval], [enable_config=yes])

@@ -3,10 +3,23 @@
 mactelnet \- A tool for telneting via MAC addresses
 .SH SYNOPSIS
 .B mactelnet
-.RI [ options ] " " < MAC-Address | hostname >
+.RI [ options ] " " < MAC-Address | hostname > " " [ command ]
 .SH DESCRIPTION
 This tool enables you to telnet other RouterOS or MAC-Telnetd enabled
 devices. You can connect to either a hostname or a MAC address.
+.PP
+If a
+.I command
+is given, it is run on the remote device and
+.B mactelnet
+exits when it completes, instead of starting an interactive session, much like
+.BR ssh (1).
+Only the output of the command is printed: the login banner, the echoed command
+and the prompt are left out, and long output is not paginated. The exit status is
+non-zero if the command could not be run. This requires
+.B libvterm
+at build time, because RouterOS interrogates the terminal on connect and expects
+a terminal emulator to answer; without it, only interactive sessions are available.
 If specified, the hostname (identity) will be looked up via
 .BR ether_hostton(3)
 (typically in

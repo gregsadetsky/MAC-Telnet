@@ -54,6 +54,9 @@
 #include <sys/mman.h>
 #endif
 #include <openssl/evp.h>
+#ifdef HAVE_LIBVTERM
+#include <vterm.h>
+#endif
 
 #if (HAVE_READPASSPHRASE == 1)
 #include <readpassphrase.h>
@@ -106,6 +109,28 @@ static int mndp_timeout = 0;
 
 static int is_a_tty = 1;
 static int quiet_mode = 0;
+static int exit_status = 0;
+
+#ifdef HAVE_LIBVTERM
+/* Non-interactive mode: run one command and exit, like ssh.
+
+   RouterOS' console has no "run command, return output" mode: it drives a VT
+   terminal, and on connect it interrogates it (height, width, scroll regions,
+   UTF-8 widths), each time asking where the cursor ended up (ESC[6n). mactelnet
+   itself is only a pipe -- interactively it is the user's terminal that answers.
+   With nobody answering, RouterOS stalls ~10s and falls back to a 24-row screen.
+
+   So drive a real terminal emulator: libvterm parses the sequences and emits the
+   replies itself (vt_output below), and the rendered screen tells us when the
+   prompt is back and what the command printed. */
+#define VT_ROWS 2000 /* a tall screen: RouterOS paginates based on the height it detects */
+#define VT_COLS 200
+
+static char *execute_command = NULL;
+static VTerm *vt = NULL;
+static VTermScreen *vtscreen = NULL;
+static int command_sent = 0;
+#endif
 static int force_md5 = 0;
 static int batch_mode = 0;
 static int no_autologin = 0;
@@ -227,6 +252,122 @@ static int send_udp(struct mt_packet *packet, int retransmit) {
 	}
 	return sent_bytes;
 }
+
+#ifdef HAVE_LIBVTERM
+/* Send bytes to the remote console, as if typed. Never retransmits: these calls
+   happen inside handle_packet(), and waiting for an ACK re-enters it. */
+static void send_console(const char *bytes, int len) {
+	struct mt_packet data;
+
+	if (len <= 0) {
+		return;
+	}
+	init_packet(&data, MT_PTYPE_DATA, srcmac, dstmac, sessionkey, outcounter);
+	add_control_packet(&data, MT_CPTYPE_PLAINDATA, (void *)bytes, len);
+	outcounter += len;
+	send_udp(&data, 0);
+}
+
+/* libvterm hands us the terminal's own replies (cursor reports, ...) here. */
+static void vt_output(const char *s, size_t len, void *user) {
+	(void)user;
+	send_console(s, (int)len);
+}
+
+/* Text of one screen row, trailing blanks removed. */
+static int vt_row(int row, char *buf, size_t buflen) {
+	VTermRect rect;
+	size_t len;
+
+	rect.start_row = row;
+	rect.end_row = row + 1;
+	rect.start_col = 0;
+	rect.end_col = VT_COLS;
+
+	len = vterm_screen_get_text(vtscreen, buf, buflen - 1, rect);
+	if (len >= buflen) {
+		len = buflen - 1;
+	}
+	buf[len] = '\0';
+	while (len > 0 && (buf[len - 1] == ' ' || buf[len - 1] == '\n')) {
+		buf[--len] = '\0';
+	}
+	return (int)len;
+}
+
+static int vt_cursor_row(void) {
+	VTermPos pos;
+	vterm_state_get_cursorpos(vterm_obtain_state(vt), &pos);
+	return pos.row;
+}
+
+/* A bare RouterOS prompt: "[user@name] >" */
+static int row_is_prompt(int row) {
+	char buf[VT_COLS + 2];
+	int len = vt_row(row, buf, sizeof(buf));
+	return len >= 3 && strcmp(buf + len - 3, "] >") == 0;
+}
+
+/* The row where the console echoed our command next to the prompt, or -1. */
+static int find_echo_row(int below) {
+	char buf[VT_COLS + 2];
+	char want[VT_COLS + 2];
+	int i, len, wlen;
+
+	wlen = snprintf(want, sizeof(want), "> %s", execute_command);
+	if (wlen <= 0 || wlen >= (int)sizeof(want)) {
+		return -1;
+	}
+	for (i = below - 1; i >= 0 && i > below - 400; --i) {
+		len = vt_row(i, buf, sizeof(buf));
+		if (len >= wlen && strcmp(buf + len - wlen, want) == 0) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+/* Feed console output to the emulator and drive the command through it. */
+static void vt_feed(const char *data, int len) {
+	int cursor, echo, i;
+
+	vterm_input_write(vt, data, len); /* replies to probes leave via vt_output() */
+	cursor = vt_cursor_row();
+
+	if (command_sent == 0) {
+		/* The console is ready once it draws a prompt. The banner above it is
+		   simply never printed. */
+		if (row_is_prompt(cursor)) {
+			send_console(execute_command, (int)strlen(execute_command));
+			send_console("\r", 1);
+			command_sent = 1;
+		}
+		return;
+	}
+
+	if (command_sent != 1) {
+		return; /* leaving: ignore whatever still arrives */
+	}
+
+	/* The console sits at the bottom of a scrolling screen, so the cursor row
+	   never moves and the echo is too fleeting to catch (echo, output and the
+	   next prompt often arrive together). Test durable state instead: a bare
+	   prompt, with our echoed command visible above it. */
+	echo = find_echo_row(cursor);
+	if (!row_is_prompt(cursor) || echo < 0) {
+		return;
+	}
+
+	for (i = echo + 1; i < cursor; ++i) {
+		char buf[VT_COLS + 2];
+		vt_row(i, buf, sizeof(buf));
+		printf("%s\n", buf);
+	}
+
+	send_console("/quit\r", 6); /* leave cleanly: killed sessions wedge the mac-server */
+	command_sent = 3;
+}
+#endif
 
 static void send_auth(char *login, char *password) {
 	struct mt_packet data;
@@ -390,7 +531,14 @@ static int handle_packet(unsigned char *data, int data_len) {
 			/* If the (remaining) data did not have a control-packet magic byte sequence,
 			   the data is raw terminal data to be outputted to the terminal. */
 			else if (cpkt.cptype == MT_CPTYPE_PLAINDATA) {
-				fwrite((const void *)cpkt.data, 1, cpkt.length, stdout);
+#ifdef HAVE_LIBVTERM
+				/* Until authentication finishes, pass data through unchanged so
+				   that login errors from the server stay visible. */
+				if (execute_command != NULL && terminal_mode) {
+					vt_feed((const char *)cpkt.data, cpkt.length);
+				} else
+#endif
+					fwrite((const void *)cpkt.data, 1, cpkt.length, stdout);
 			}
 
 			/* END_AUTH means that the user/password negotiation is done, and after this point
@@ -428,6 +576,15 @@ static int handle_packet(unsigned char *data, int data_len) {
 		if (!quiet_mode) {
 			fprintf(stderr, _("Connection closed.\n"));
 		}
+
+#ifdef HAVE_LIBVTERM
+		/* Session ended before the command could run: login failed, or the console
+		   never became ready. Say so instead of exiting successfully. */
+		if (execute_command != NULL && command_sent == 0) {
+			fprintf(stderr, _("Command not executed: login failed or console not ready.\n"));
+			exit_status = 1;
+		}
+#endif
 
 		/* exit */
 		running = 0;
@@ -621,8 +778,8 @@ int main(int argc, char **argv) {
 	if (argc - optind < 1 || print_help) {
 		print_version();
 		fprintf(stderr,
-				_("Usage: %s <MAC|identity> [-nqoA] [-a <path>] [-t <timeout>] [-u <user>] [-p <password>] [-U <user>] "
-				  "| -l [-B] [-t <timeout>]\n"),
+				_("Usage: %s <MAC|identity> [command] [-nqoA] [-a <path>] [-t <timeout>] [-u <user>] [-p <password>] "
+				  "[-U <user>] | -l [-B] [-t <timeout>]\n"),
 				argv[0]);
 
 		if (print_help) {
@@ -632,6 +789,9 @@ int main(int argc, char **argv) {
 					  "                 discover it.\n"
 					  "  identity       The identity/name of your destination device. Uses\n"
 					  "                 MNDP protocol to find it.\n"
+					  "  command        Run one command non-interactively and exit, like ssh. Only the\n"
+					  "                 output of the command is printed. Implies -q. For example:\n"
+					  "                 mactelnet -u admin -p pw MAC '/system resource print'\n"
 					  "  -l             List/Search for routers nearby (MNDP). You may use -t to set timeout.\n"
 					  "  -B             Batch mode. Use computer readable output (CSV), for use with -l.\n"
 					  "  -n             Do not use broadcast packets. Less insecure but requires\n"
@@ -653,7 +813,31 @@ int main(int argc, char **argv) {
 		return 1;
 	}
 
+#ifdef HAVE_LIBVTERM
+	/* An argument after the destination is a command to run non-interactively. */
+	if (argc - optind > 1) {
+		execute_command = argv[optind + 1];
+	}
+#else
+	if (argc - optind > 1) {
+		fprintf(stderr, _("Running a command requires libvterm, which was missing at build time.\n"));
+		return 1;
+	}
+#endif
+
 	is_a_tty = isatty(fileno(stdout)) && isatty(fileno(stdin));
+#ifdef HAVE_LIBVTERM
+	if (execute_command != NULL) {
+		/* Not a user session: no raw terminal, no resize handling, no chatter. */
+		is_a_tty = 0;
+
+		vt = vterm_new(VT_ROWS, VT_COLS);
+		vterm_set_utf8(vt, 1);
+		vterm_output_set_callback(vt, vt_output, NULL);
+		vtscreen = vterm_obtain_screen(vt);
+		vterm_screen_reset(vtscreen, 1);
+	}
+#endif
 	if (!is_a_tty) {
 		quiet_mode = 1;
 	}
@@ -815,6 +999,11 @@ int main(int argc, char **argv) {
 		fd_set read_fds;
 		int reads;
 		static int terminal_gone = 0;
+#ifdef HAVE_LIBVTERM
+		if (execute_command != NULL) {
+			terminal_gone = 1; /* the command is driven from handle_packet() */
+		}
+#endif
 		struct timeval timeout;
 
 		/* Init select */
@@ -878,5 +1067,5 @@ int main(int argc, char **argv) {
 		free(interface);
 	}
 
-	return 0;
+	return exit_status;
 }

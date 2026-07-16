@@ -9,8 +9,8 @@ sbin_PROGRAMS = mactelnetd
 endif
 
 mactelnet_SOURCES = config.h mactelnet.c mactelnet.h protocol.c protocol.h console.c console.h interfaces.c interfaces.h mndp.c mndp.h autologin.c autologin.h extra.h utlist.h mtwei.c mtwei.h
-mactelnet_CFLAGS = -DFROM_MACTELNET
-mactelnet_LDADD = $(CRYPTO_LIBS)
+mactelnet_CFLAGS = -DFROM_MACTELNET $(VTERM_CFLAGS)
+mactelnet_LDADD = $(CRYPTO_LIBS) $(VTERM_LIBS)
 
 mactelnetd_SOURCES = config.h mactelnetd.c protocol.c protocol.h interfaces.c interfaces.h console.c console.h users.c users.h extra.h utlist.h mtwei.c mtwei.h
 mactelnetd_CFLAGS = -DFROM_MACTELNETD -DUSERSFILE='"$(sysconfdir)/mactelnetd.users"'
