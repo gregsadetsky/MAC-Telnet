@@ -16,7 +16,17 @@ exits when it completes, instead of starting an interactive session, much like
 .BR ssh (1).
 Only the output of the command is printed: the login banner, the echoed command
 and the prompt are left out, and long output is not paginated. The exit status is
-non-zero if the command could not be run. This requires
+non-zero if the command could not be run.
+.PP
+The command must be one that finishes: its output is printed once the console
+returns to a prompt, so a command that streams forever (a bare
+.BR /ping ,
+say \(em use
+.BR count= )
+prints nothing. Such a command is interrupted after 30 seconds, and the exit
+status is non-zero.
+.PP
+Running a command requires
 .B libvterm
 at build time, because RouterOS interrogates the terminal on connect and expects
 a terminal emulator to answer; without it, only interactive sessions are available.

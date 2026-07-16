@@ -125,8 +125,10 @@ static int exit_status = 0;
    prompt is back and what the command printed. */
 #define VT_ROWS 2000 /* a tall screen: RouterOS paginates based on the height it detects */
 #define VT_COLS 200
+#define VT_TIMEOUT 30 /* seconds to wait for the command to finish */
 
 static char *execute_command = NULL;
+static time_t vt_deadline = 0;
 static VTerm *vt = NULL;
 static VTermScreen *vtscreen = NULL;
 static int command_sent = 0;
@@ -341,6 +343,7 @@ static void vt_feed(const char *data, int len) {
 			send_console(execute_command, (int)strlen(execute_command));
 			send_console("\r", 1);
 			command_sent = 1;
+			vt_deadline = time(NULL) + VT_TIMEOUT;
 		}
 		return;
 	}
@@ -1005,6 +1008,21 @@ int main(int argc, char **argv) {
 		}
 #endif
 		struct timeval timeout;
+
+#ifdef HAVE_LIBVTERM
+		/* A command that never finishes (eg. an unbounded /ping) would hang
+		   forever, since output is only printed once the prompt returns. Checked
+		   on every pass: a streaming command keeps select() from timing out. */
+		if (execute_command != NULL && command_sent == 1 && time(NULL) > vt_deadline) {
+			send_console("\003", 1); /* ^C: stop whatever is running */
+			send_console("/quit\r", 6);
+			fprintf(stderr, _("Command did not finish within %d seconds.\n"), VT_TIMEOUT);
+			exit_status = 1;
+			command_sent = 3;
+			running = 0;
+			continue;
+		}
+#endif
 
 		/* Init select */
 		FD_ZERO(&read_fds);
